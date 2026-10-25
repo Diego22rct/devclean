@@ -14,6 +14,21 @@ pub struct DiscoveredArtifact {
     pub sub_paths: Vec<PathBuf>,
 }
 
+impl DiscoveredArtifact {
+    /// Returns the physical target paths to size or delete.
+    ///
+    /// For aggregated artifacts (e.g. Python `__pycache__`), returns references
+    /// to all items in `sub_paths`. For standard artifacts, returns a single-element
+    /// vector containing `&self.path`.
+    pub fn target_paths(&self) -> Vec<&Path> {
+        if self.sub_paths.is_empty() {
+            vec![&self.path]
+        } else {
+            self.sub_paths.iter().map(|p| p.as_path()).collect()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ProjectInfo {
     name: String,
@@ -67,8 +82,12 @@ pub fn scan_directory(root: &Path, sender: Sender<DiscoveredArtifact>) {
             busy_timeout: std::time::Duration::from_secs(10),
         })
         .process_read_dir(move |_depth, dir_path, state, children| {
-            // Guard: Never inspect or descend into .git
-            if dir_path.file_name().map(|n| n == ".git").unwrap_or(false) {
+            // Guard: Never inspect or descend into .git (case-insensitive for Windows NTFS)
+            if dir_path
+                .file_name()
+                .map(|n| n.to_string_lossy().eq_ignore_ascii_case(".git"))
+                .unwrap_or(false)
+            {
                 children.clear();
                 return;
             }
@@ -76,7 +95,7 @@ pub fn scan_directory(root: &Path, sender: Sender<DiscoveredArtifact>) {
             // Exclude .git entries completely
             children.retain(|c| {
                 if let Ok(entry) = c {
-                    entry.file_name != ".git"
+                    !entry.file_name.to_string_lossy().eq_ignore_ascii_case(".git")
                 } else {
                     true
                 }
@@ -207,9 +226,11 @@ pub fn scan_directory(root: &Path, sender: Sender<DiscoveredArtifact>) {
                         .as_ref()
                         .map(|p| p.ecosystem == Ecosystem::Flutter)
                         .unwrap_or(false);
-                    let parent_is_flutter =
-                        dir_path.file_name().map(|n| n == "flutter").unwrap_or(false);
-                    if is_flutter_proj || parent_is_flutter {
+                    let parent_is_flutter = dir_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().eq_ignore_ascii_case("flutter"))
+                        .unwrap_or(false);
+                    if is_flutter_proj && parent_is_flutter {
                         entry.read_children_path = None;
                         let proj_name = state
                             .current_project

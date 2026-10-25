@@ -42,6 +42,14 @@ fn test_scanner_never_descends_or_flags_git() {
     create_dir_all(git_dir.join("node_modules")).unwrap();
     create_dir_all(git_dir.join("objects")).unwrap();
 
+    // Setup mixed-case .Git directory with fake target inside
+    let git_dir_mixed = proj.join(".Git");
+    create_dir_all(git_dir_mixed.join("target")).unwrap();
+
+    // Setup uppercase .GIT directory with fake bin inside
+    let git_dir_upper = proj.join(".GIT");
+    create_dir_all(git_dir_upper.join("bin")).unwrap();
+
     // Normal artifact
     create_dir_all(proj.join("node_modules")).unwrap();
 
@@ -49,7 +57,7 @@ fn test_scanner_never_descends_or_flags_git() {
 
     assert_eq!(artifacts.len(), 1);
     assert!(artifacts[0].path.ends_with("node_modules"));
-    assert!(!artifacts[0].path.to_string_lossy().contains(".git"));
+    assert!(!artifacts[0].path.to_string_lossy().to_lowercase().contains(".git"));
 }
 
 #[test]
@@ -271,5 +279,62 @@ fn test_scanner_multiple_python_projects_aggregated_separately() {
     let beta = artifacts.iter().find(|a| a.project_name == "service-beta").unwrap();
     assert_eq!(beta.ecosystem, Ecosystem::Python);
     assert_eq!(beta.sub_paths.len(), 1);
+}
+
+#[test]
+fn test_scanner_flutter_ephemeral_restrictions() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // Flutter project with valid ephemeral under windows/flutter
+    // and invalid ephemeral under lib/ephemeral
+    let flutter_proj = root.join("flutter_app");
+    create_dir_all(flutter_proj.join("windows").join("flutter").join("ephemeral")).unwrap();
+    create_dir_all(flutter_proj.join("lib").join("ephemeral")).unwrap();
+    File::create(flutter_proj.join("pubspec.yaml")).unwrap();
+
+    // Non-flutter folder containing flutter/ephemeral
+    let random_dir = root.join("random_docs");
+    create_dir_all(random_dir.join("flutter").join("ephemeral")).unwrap();
+
+    let artifacts = scan_directory_sync(root);
+
+    // Only the valid windows/flutter/ephemeral inside flutter_proj should be flagged
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].ecosystem, Ecosystem::Flutter);
+    assert_eq!(artifacts[0].project_name, "flutter_app");
+    assert!(artifacts[0].path.ends_with("ephemeral"));
+    assert!(artifacts[0].path.to_string_lossy().contains("windows"));
+}
+
+#[test]
+fn test_discovered_artifact_target_paths() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+
+    // Standard artifact with empty sub_paths
+    let standard = DiscoveredArtifact {
+        path: root.join("node_modules"),
+        project_name: "test".to_string(),
+        ecosystem: Ecosystem::Node,
+        sub_paths: vec![],
+    };
+    let targets = standard.target_paths();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0], standard.path.as_path());
+
+    // Aggregated artifact with multiple sub_paths
+    let sub1 = root.join("pkg1").join("__pycache__");
+    let sub2 = root.join("pkg2").join("__pycache__");
+    let aggregated = DiscoveredArtifact {
+        path: root.join("__pycache__"),
+        project_name: "test_py".to_string(),
+        ecosystem: Ecosystem::Python,
+        sub_paths: vec![sub1.clone(), sub2.clone()],
+    };
+    let agg_targets = aggregated.target_paths();
+    assert_eq!(agg_targets.len(), 2);
+    assert_eq!(agg_targets[0], sub1.as_path());
+    assert_eq!(agg_targets[1], sub2.as_path());
 }
 
