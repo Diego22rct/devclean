@@ -17,10 +17,6 @@ pub struct SizeResult {
 /// If `path` does not exist or is unreadable, returns `(0, None)`.
 /// Subdirectory symlinks are not traversed to avoid cycles and escaping the artifact boundary.
 pub fn calculate_dir_size(path: &Path) -> (u64, Option<chrono::DateTime<chrono::Local>>) {
-    if !path.exists() {
-        return (0, None);
-    }
-
     // Try standard canonicalization to get \\?\ extended-length paths on Windows; fallback to dunce / path
     let canonical = std::fs::canonicalize(path)
         .or_else(|_| dunce::canonicalize(path))

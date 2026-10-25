@@ -90,6 +90,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn parallel sizer workers
     let _sizer_handle = sizer::spawn_artifact_sizer_workers(sizer_in_rx, sizer_out_tx);
 
+    // Channels and background worker for asynchronous deletion
+    let (deleter_task_tx, deleter_task_rx) =
+        crossbeam_channel::unbounded::<Vec<devclean::app::DeletionTask>>();
+    let (deleter_res_tx, deleter_res_rx) =
+        crossbeam_channel::unbounded::<devclean::app::DeletionProgress>();
+
+    let _deleter_handle = std::thread::Builder::new()
+        .name("deleter".to_string())
+        .spawn(move || {
+            while let Ok(tasks) = deleter_task_rx.recv() {
+                let total = tasks.len();
+                for (idx, task) in tasks.into_iter().enumerate() {
+                    let targets: Vec<&std::path::Path> =
+                        task.target_paths.iter().map(|p| p.as_path()).collect();
+                    let res = devclean::deleter::delete_paths(
+                        &targets,
+                        task.reported_bytes,
+                        task.dry_run,
+                    );
+                    let freed_bytes = match &res {
+                        devclean::deleter::DeletionResult::Success { freed_bytes } => *freed_bytes,
+                        devclean::deleter::DeletionResult::Failed { .. } => 0,
+                    };
+                    let progress = devclean::app::DeletionProgress {
+                        completed: idx + 1,
+                        total,
+                        freed_bytes,
+                        result: res,
+                        path: task.path,
+                    };
+                    let _ = deleter_res_tx.send(progress);
+                }
+            }
+        })
+        .expect("Failed to spawn deleter background thread");
+
     // Spawn background directory scanner thread
     let scan_root = root_path;
     let (scan_done_tx, scan_done_rx) = crossbeam_channel::bounded::<()>(1);
@@ -121,6 +157,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Drain calculated sizes from workers
         while let Ok(size_res) = sizer_out_rx.try_recv() {
             app.update_size(size_res);
+        }
+
+        // Dispatch pending deletion tasks to background worker
+        if let Some(tasks) = app.take_pending_deletions() {
+            let _ = deleter_task_tx.send(tasks);
+        }
+
+        // Drain deletion progress updates from background worker
+        while let Ok(progress) = deleter_res_rx.try_recv() {
+            app.apply_deletion_progress(progress);
         }
 
         // Render current TUI frame

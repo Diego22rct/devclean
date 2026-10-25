@@ -122,3 +122,88 @@ fn test_render_message_modal() {
     assert!(content.contains("Test Popup"));
     assert!(content.contains("Important operation completed"));
 }
+
+#[test]
+fn test_render_empty_app_artifact_path_column() {
+    let mut app = App::new(PathBuf::from("C:\\Dev\\project"), false);
+    app.scanning_done = true;
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal
+        .draw(|frame| {
+            render(frame, &app);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    assert!(content.contains("No regenerable build artifacts discovered."));
+
+    // Now test scanning state
+    app.scanning_done = false;
+    terminal
+        .draw(|frame| {
+            render(frame, &app);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+    assert!(content.contains("Scanning directories for build artifacts..."));
+}
+
+#[test]
+fn test_render_deleting_modal() {
+    let mut app = App::new(PathBuf::from("/test/root"), false);
+    app.modal = ModalState::Deleting {
+        completed: 2,
+        total: 5,
+        current_item: "web/node_modules".to_string(),
+    };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal
+        .draw(|frame| {
+            render(frame, &app);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    assert!(content.contains("Deleting [2/5]"));
+    assert!(content.contains("web/node_modules"));
+    assert!(content.contains("40%"));
+    assert!(content.contains("Please wait while artifacts are deleted..."));
+}
+
+#[test]
+fn test_render_multiline_message_modal() {
+    let mut app = App::new(PathBuf::from("/test/root"), false);
+    app.modal = ModalState::Message {
+        title: "Deletion Complete (Errors Encountered)".to_string(),
+        text: "Encountered errors:\nFailed to delete dir 1: Access denied\nFailed to delete dir 2: File locked".to_string(),
+    };
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal
+        .draw(|frame| {
+            render(frame, &app);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let content = format!("{:?}", buffer);
+
+    assert!(content.contains("Deletion Complete (Errors Encountered)"));
+    assert!(content.contains("Encountered errors:"));
+    assert!(content.contains("Failed to delete dir 1: Access denied"));
+    assert!(content.contains("Failed to delete dir 2: File locked"));
+}

@@ -67,10 +67,44 @@ pub enum ModalState {
         count: usize,
         total_bytes: u64,
     },
+    Deleting {
+        completed: usize,
+        total: usize,
+        current_item: String,
+    },
     Message {
         title: String,
         text: String,
     },
+}
+
+/// A background deletion task representation for a single discovered artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionTask {
+    pub path: PathBuf,
+    pub target_paths: Vec<PathBuf>,
+    pub reported_bytes: u64,
+    pub display_name: String,
+    pub dry_run: bool,
+}
+
+/// Progress update message streamed from the background deleter thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub freed_bytes: u64,
+    pub result: deleter::DeletionResult,
+    pub path: PathBuf,
+}
+
+/// Tracking state for an in-flight background deletion operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActiveDeletion {
+    pub tasks: Vec<DeletionTask>,
+    pub freed_bytes: u64,
+    pub errors: Vec<String>,
+    pub successful_paths: Vec<PathBuf>,
 }
 
 /// Presentation model for a single artifact item in the TUI list.
@@ -154,6 +188,8 @@ pub struct App {
     pub is_busy: bool,
     pub status_message: Option<String>,
     pub should_quit: bool,
+    pub pending_deletion_tasks: Option<Vec<DeletionTask>>,
+    pub active_deletion: Option<ActiveDeletion>,
 }
 
 impl App {
@@ -171,6 +207,8 @@ impl App {
             is_busy: false,
             status_message: None,
             should_quit: false,
+            pending_deletion_tasks: None,
+            active_deletion: None,
         }
     }
 
@@ -327,12 +365,13 @@ impl App {
         self.modal = ModalState::None;
     }
 
-    /// Confirms and executes deletion (or simulation in dry-run mode) on all selected artifacts.
-    pub fn confirm_delete_and_execute(&mut self) {
+    /// Initiates background deletion for all currently selected artifacts.
+    /// Sets `is_busy` to true, transitions `modal` to `ModalState::Deleting`,
+    /// and stages pending tasks to be dispatched by the event loop.
+    pub fn start_deletion(&mut self) -> Option<Vec<DeletionTask>> {
         if self.is_busy {
-            return;
+            return None;
         }
-        self.is_busy = true;
 
         let selected_indices: Vec<usize> = self
             .items
@@ -343,40 +382,112 @@ impl App {
 
         if selected_indices.is_empty() {
             self.modal = ModalState::None;
-            self.is_busy = false;
-            return;
+            return None;
         }
 
-        let mut freed_accum = 0u64;
-        let mut errors: Vec<String> = Vec::new();
-        let mut successfully_deleted_indices = Vec::new();
+        let tasks: Vec<DeletionTask> = selected_indices
+            .iter()
+            .map(|&idx| {
+                let item = &self.items[idx];
+                let display_name = item
+                    .path
+                    .strip_prefix(&self.root_path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| item.path.display().to_string());
 
-        for &idx in &selected_indices {
-            let item = &self.items[idx];
-            let targets = item.target_paths();
-            let reported = item.size_bytes.unwrap_or(0);
-            match deleter::delete_paths(&targets, reported, self.dry_run) {
+                DeletionTask {
+                    path: item.path.clone(),
+                    target_paths: item.target_paths().into_iter().map(|p| p.to_path_buf()).collect(),
+                    reported_bytes: item.size_bytes.unwrap_or(0),
+                    display_name,
+                    dry_run: self.dry_run,
+                }
+            })
+            .collect();
+
+        let total = tasks.len();
+        let first_item = tasks[0].display_name.clone();
+
+        self.is_busy = true;
+        self.modal = ModalState::Deleting {
+            completed: 0,
+            total,
+            current_item: first_item,
+        };
+
+        self.active_deletion = Some(ActiveDeletion {
+            tasks: tasks.clone(),
+            freed_bytes: 0,
+            errors: Vec::new(),
+            successful_paths: Vec::new(),
+        });
+
+        self.pending_deletion_tasks = Some(tasks.clone());
+
+        Some(tasks)
+    }
+
+    /// Takes staged pending deletion tasks so they can be dispatched to the background worker.
+    pub fn take_pending_deletions(&mut self) -> Option<Vec<DeletionTask>> {
+        self.pending_deletion_tasks.take()
+    }
+
+    /// Receives a progress update from the background deletion worker and updates state.
+    pub fn apply_deletion_progress(&mut self, progress: DeletionProgress) {
+        let (is_done, next_item) = if let Some(active) = &mut self.active_deletion {
+            match &progress.result {
                 deleter::DeletionResult::Success { freed_bytes } => {
-                    freed_accum = freed_accum.saturating_add(freed_bytes);
-                    successfully_deleted_indices.push(idx);
+                    active.freed_bytes = active.freed_bytes.saturating_add(*freed_bytes);
+                    active.successful_paths.push(progress.path.clone());
                 }
                 deleter::DeletionResult::Failed { error } => {
-                    errors.push(error);
+                    active.errors.push(error.clone());
                 }
             }
+            let is_done = progress.completed >= progress.total;
+            let next_item = if !is_done && progress.completed < active.tasks.len() {
+                Some(active.tasks[progress.completed].display_name.clone())
+            } else {
+                None
+            };
+            (is_done, next_item)
+        } else {
+            (progress.completed >= progress.total, None)
+        };
+
+        if is_done {
+            self.finish_deletion();
+        } else if let Some(item_name) = next_item {
+            self.modal = ModalState::Deleting {
+                completed: progress.completed,
+                total: progress.total,
+                current_item: item_name,
+            };
         }
+    }
 
-        self.total_freed_bytes = self.total_freed_bytes.saturating_add(freed_accum);
+    /// Finalizes the deletion operation, updates metrics, removes deleted items, and shows the summary modal.
+    pub fn finish_deletion(&mut self) {
+        let active = match self.active_deletion.take() {
+            Some(a) => a,
+            None => {
+                self.is_busy = false;
+                self.modal = ModalState::None;
+                return;
+            }
+        };
 
-        // Remove deleted items from highest index to lowest
-        successfully_deleted_indices.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in successfully_deleted_indices {
-            self.items.remove(idx);
+        self.total_freed_bytes = self.total_freed_bytes.saturating_add(active.freed_bytes);
+
+        // Remove successfully deleted items from self.items
+        for path in &active.successful_paths {
+            if let Some(idx) = self.items.iter().position(|i| i.path == *path) {
+                self.items.remove(idx);
+            }
         }
-
         self.adjust_cursor();
 
-        let freed_str = format_bytes(freed_accum);
+        let freed_str = format_bytes(active.freed_bytes);
 
         if self.dry_run {
             let msg = format!("[Simulation] Would have freed {}", freed_str);
@@ -385,24 +496,51 @@ impl App {
                 title: "Dry Run Simulation".to_string(),
                 text: msg,
             };
-        } else if errors.is_empty() {
+        } else if active.errors.is_empty() {
             let msg = format!("Successfully freed {}", freed_str);
             self.status_message = Some(msg.clone());
             self.modal = ModalState::Message {
-                title: "Deletion Completed".to_string(),
+                title: "Deletion Complete".to_string(),
                 text: msg,
             };
         } else {
-            let err_summary = errors.join("\n");
-            let msg = format!("Freed {}. Encountered {} errors.", freed_str, errors.len());
+            let err_summary = active.errors.join("\n");
+            let msg = format!("Freed {}. Encountered {} errors.", freed_str, active.errors.len());
             self.status_message = Some(msg);
             self.modal = ModalState::Message {
-                title: "Deletion Failed".to_string(),
+                title: "Deletion Complete (Errors Encountered)".to_string(),
                 text: format!("Encountered errors:\n{}", err_summary),
             };
         }
 
         self.is_busy = false;
+    }
+
+    /// Confirms and executes deletion (or simulation in dry-run mode) on all selected artifacts.
+    pub fn confirm_delete_and_execute(&mut self) {
+        if self.is_busy {
+            return;
+        }
+
+        if let Some(tasks) = self.start_deletion() {
+            let _ = self.take_pending_deletions();
+            let total = tasks.len();
+            for (idx, task) in tasks.into_iter().enumerate() {
+                let targets: Vec<&Path> = task.target_paths.iter().map(|p| p.as_path()).collect();
+                let result = deleter::delete_paths(&targets, task.reported_bytes, task.dry_run);
+                let freed_bytes = match &result {
+                    deleter::DeletionResult::Success { freed_bytes } => *freed_bytes,
+                    deleter::DeletionResult::Failed { .. } => 0,
+                };
+                self.apply_deletion_progress(DeletionProgress {
+                    completed: idx + 1,
+                    total,
+                    freed_bytes,
+                    result,
+                    path: task.path,
+                });
+            }
+        }
     }
 
     /// Handles keyboard input events, routing actions according to modal state.
@@ -414,13 +552,14 @@ impl App {
         match &self.modal {
             ModalState::ConfirmDelete { .. } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.confirm_delete_and_execute();
+                    self.start_deletion();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.close_modal();
                 }
                 _ => {}
             },
+            ModalState::Deleting { .. } => {}
             ModalState::Message { .. } => match key.code {
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
                     self.close_modal();

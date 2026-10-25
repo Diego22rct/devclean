@@ -165,8 +165,8 @@ pub fn render(frame: &mut Frame, app: &App) {
             vec![Row::new(vec![
                 Cell::from(""),
                 Cell::from(""),
-                Cell::from("No regenerable build artifacts discovered."),
                 Cell::from(""),
+                Cell::from("No regenerable build artifacts discovered."),
                 Cell::from(""),
                 Cell::from(""),
             ])
@@ -175,8 +175,8 @@ pub fn render(frame: &mut Frame, app: &App) {
             vec![Row::new(vec![
                 Cell::from(""),
                 Cell::from(""),
-                Cell::from("Scanning directories for build artifacts..."),
                 Cell::from(""),
+                Cell::from("Scanning directories for build artifacts..."),
                 Cell::from(""),
                 Cell::from(""),
             ])
@@ -421,24 +421,102 @@ pub fn render(frame: &mut Frame, app: &App) {
 
             frame.render_widget(popup, area);
         }
-        ModalState::Message { title, text } => {
-            let area = centered_rect(64, 8, frame.area());
+        ModalState::Deleting {
+            completed,
+            total,
+            current_item,
+        } => {
+            let area = centered_rect(68, 9, frame.area());
             frame.render_widget(Clear, area);
+
+            let border_color = if app.dry_run {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            };
+
+            let percent = (*completed * 100).checked_div(*total).unwrap_or(0);
+            let gauge_width = 30usize;
+            let filled = (*completed * gauge_width).checked_div(*total).unwrap_or(0);
+            let bar = format!(
+                "[{}{}] {:>3}%",
+                "=".repeat(filled),
+                " ".repeat(gauge_width.saturating_sub(filled)),
+                percent
+            );
 
             let lines = vec![
                 Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        format!("Deleting [{}/{}]: ", completed, total),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        current_item.as_str(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
                 Line::from(Span::styled(
-                    text.as_str(),
-                    Style::default().fg(Color::White),
+                    bar,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "[Enter / Esc / Space] Close",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    "Please wait while artifacts are deleted...",
+                    Style::default().fg(Color::DarkGray),
                 )),
             ];
+
+            let title = if app.dry_run {
+                " Simulating Deletion "
+            } else {
+                " Deleting Artifacts "
+            };
+
+            let popup = Paragraph::new(lines).alignment(Alignment::Center).block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(
+                        Style::default()
+                            .fg(border_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+            );
+
+            frame.render_widget(popup, area);
+        }
+        ModalState::Message { title, text } => {
+            let line_count = text.lines().count();
+            let max_line_len = text.lines().map(|l| l.len()).max().unwrap_or(0);
+            let width = ((max_line_len as u16 + 8).max(64)).min(frame.area().width.saturating_sub(2));
+            let height = ((line_count as u16 + 6).max(8)).min(frame.area().height.saturating_sub(2));
+
+            let area = centered_rect(width, height, frame.area());
+            frame.render_widget(Clear, area);
+
+            let mut lines = vec![Line::from("")];
+            lines.extend(text.lines().map(|l| {
+                Line::from(Span::styled(
+                    l.to_string(),
+                    Style::default().fg(Color::White),
+                ))
+            }));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "[Enter / Esc / Space] Close",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
 
             let popup = Paragraph::new(lines).alignment(Alignment::Center).block(
                 Block::default()

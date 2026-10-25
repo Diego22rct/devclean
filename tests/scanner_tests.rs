@@ -10,13 +10,13 @@ fn test_scanner_discovers_node_modules_and_rust_target() {
 
     // Setup Node project
     let node_proj = root.join("my-web-app");
-    create_dir_all(&node_proj.join("node_modules")).unwrap();
-    create_dir_all(&node_proj.join(".next")).unwrap();
+    create_dir_all(node_proj.join("node_modules")).unwrap();
+    create_dir_all(node_proj.join(".next")).unwrap();
     File::create(node_proj.join("package.json")).unwrap();
 
     // Setup Rust project
     let rust_proj = root.join("my-rust-crate");
-    create_dir_all(&rust_proj.join("target")).unwrap();
+    create_dir_all(rust_proj.join("target")).unwrap();
     File::create(rust_proj.join("Cargo.toml")).unwrap();
 
     let artifacts = scan_directory_sync(root);

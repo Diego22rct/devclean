@@ -370,7 +370,7 @@ fn test_actual_deletion() {
 
     // Modal shows success message
     if let ModalState::Message { title, text } = &app.modal {
-        assert!(title.contains("Completed") || title.contains("Success"));
+        assert!(title.contains("Complete") || title.contains("Success"));
         assert!(text.contains("Successfully freed"));
     } else {
         panic!("Expected ModalState::Message, got {:?}", app.modal);
@@ -670,9 +670,110 @@ fn test_deletion_with_partial_failure() {
     assert_eq!(app.items[0].project_name, "missing");
     // Modal should inform user of error
     if let ModalState::Message { title, text } = &app.modal {
-        assert!(title.contains("Failed") || title.contains("Error"));
+        assert!(title.contains("Failed") || title.contains("Error") || title.contains("Complete"));
         assert!(text.contains("errors") || text.contains("Path does not exist"));
     } else {
         panic!("Expected ModalState::Message with error details");
+    }
+}
+
+#[test]
+fn test_asynchronous_deletion_progress_streaming() {
+    use devclean::app::DeletionProgress;
+    use devclean::deleter::DeletionResult;
+
+    let tmp = tempdir().unwrap();
+    let folder1 = tmp.path().join("pkg1").join("target");
+    let folder2 = tmp.path().join("pkg2").join("node_modules");
+    create_dir_all(&folder1).unwrap();
+    create_dir_all(&folder2).unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf(), false);
+    app.add_discovered(DiscoveredArtifact {
+        path: folder1.clone(),
+        project_name: "pkg1".to_string(),
+        ecosystem: Ecosystem::Rust,
+        sub_paths: vec![],
+    });
+    app.add_discovered(DiscoveredArtifact {
+        path: folder2.clone(),
+        project_name: "pkg2".to_string(),
+        ecosystem: Ecosystem::Node,
+        sub_paths: vec![],
+    });
+
+    app.update_size(SizeResult {
+        path: folder1.clone(),
+        size_bytes: 1024,
+        last_modified: None,
+    });
+    app.update_size(SizeResult {
+        path: folder2.clone(),
+        size_bytes: 2048,
+        last_modified: None,
+    });
+
+    // Select all
+    app.select_all();
+    assert_eq!(app.selected_count(), 2);
+
+    // Start deletion
+    let tasks = app.start_deletion().expect("Tasks should be created");
+    assert_eq!(tasks.len(), 2);
+    assert!(app.is_busy);
+
+    // Initial modal state is Deleting with 0/2 completed
+    match &app.modal {
+        ModalState::Deleting { completed, total, .. } => {
+            assert_eq!(*completed, 0);
+            assert_eq!(*total, 2);
+        }
+        other => panic!("Expected ModalState::Deleting, got {:?}", other),
+    }
+
+    // Pending tasks are staged and can be taken by main loop
+    let pending = app.take_pending_deletions().expect("Pending tasks should exist");
+    assert_eq!(pending.len(), 2);
+    assert!(app.take_pending_deletions().is_none());
+
+    // Stream progress for task 1
+    app.apply_deletion_progress(DeletionProgress {
+        completed: 1,
+        total: 2,
+        freed_bytes: 1024,
+        result: DeletionResult::Success { freed_bytes: 1024 },
+        path: folder1.clone(),
+    });
+
+    assert!(app.is_busy);
+    match &app.modal {
+        ModalState::Deleting { completed, total, current_item } => {
+            assert_eq!(*completed, 1);
+            assert_eq!(*total, 2);
+            assert!(current_item.contains("pkg2"));
+        }
+        other => panic!("Expected ModalState::Deleting, got {:?}", other),
+    }
+
+    // Stream progress for task 2 (final task)
+    app.apply_deletion_progress(DeletionProgress {
+        completed: 2,
+        total: 2,
+        freed_bytes: 2048,
+        result: DeletionResult::Success { freed_bytes: 2048 },
+        path: folder2.clone(),
+    });
+
+    // Deletion is now finished
+    assert!(!app.is_busy);
+    assert_eq!(app.total_freed_bytes, 3072);
+    assert_eq!(app.items.len(), 0);
+
+    match &app.modal {
+        ModalState::Message { title, text } => {
+            assert!(title.contains("Complete"));
+            assert!(text.contains("3.00 KB"));
+        }
+        other => panic!("Expected ModalState::Message, got {:?}", other),
     }
 }
